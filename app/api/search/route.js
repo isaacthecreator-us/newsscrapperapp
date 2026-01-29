@@ -1,5 +1,48 @@
 import { NextResponse } from 'next/server';
 
+// Models to try in order of preference
+const MODELS = [
+  'gemini-1.5-flash',
+  'gemini-1.5-flash-latest', 
+  'gemini-1.5-pro',
+  'gemini-2.0-flash',
+];
+
+async function callGeminiAPI(apiKey, model, systemInstruction, userPrompt, useGrounding = true) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  
+  const requestBody = {
+    contents: [
+      {
+        role: 'user',
+        parts: [{ text: userPrompt }]
+      }
+    ],
+    systemInstruction: {
+      parts: [{ text: systemInstruction }]
+    },
+    generationConfig: {
+      temperature: 0.7,
+      topK: 40,
+      topP: 0.95,
+      maxOutputTokens: 8192,
+    }
+  };
+
+  // Add grounding tool if enabled
+  if (useGrounding) {
+    requestBody.tools = [{ googleSearch: {} }];
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody)
+  });
+
+  return response.json();
+}
+
 export async function POST(request) {
   const { query, dateFrom, dateTo, deepResearch } = await request.json();
 
@@ -71,45 +114,74 @@ ${deepResearch ? 'Conduct comprehensive deep research across multiple reputable 
 
 Return the results as valid JSON only, no other text.`;
 
-    // Gemini API endpoint with grounding (Google Search)
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+    let data = null;
+    let lastError = null;
+    let usedModel = null;
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: userPrompt }]
+    // Try each model until one works
+    for (const model of MODELS) {
+      try {
+        console.log(`Trying model: ${model}`);
+        data = await callGeminiAPI(apiKey, model, systemInstruction, userPrompt, true);
+        
+        // Check if we got a quota error
+        if (data.error) {
+          const errorMsg = data.error.message || '';
+          if (errorMsg.includes('quota') || errorMsg.includes('rate') || errorMsg.includes('limit')) {
+            console.log(`Quota exceeded for ${model}, trying next...`);
+            lastError = data.error;
+            
+            // Wait a bit before trying next model
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            continue;
           }
-        ],
-        systemInstruction: {
-          parts: [{ text: systemInstruction }]
-        },
-        tools: [
-          {
-            googleSearch: {}
-          }
-        ],
-        generationConfig: {
-          temperature: 0.7,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 8192,
+          // Some other error - still try next model
+          lastError = data.error;
+          continue;
         }
-      })
-    });
 
-    const data = await response.json();
+        // Success!
+        usedModel = model;
+        break;
+      } catch (err) {
+        console.error(`Error with model ${model}:`, err);
+        lastError = err;
+        continue;
+      }
+    }
 
-    if (data.error) {
-      console.error('Gemini API Error:', data.error);
+    // If all models with grounding failed, try without grounding as last resort
+    if (!usedModel && lastError) {
+      console.log('Trying without grounding...');
+      for (const model of MODELS) {
+        try {
+          data = await callGeminiAPI(apiKey, model, systemInstruction, userPrompt, false);
+          if (!data.error) {
+            usedModel = model;
+            break;
+          }
+        } catch (err) {
+          continue;
+        }
+      }
+    }
+
+    // If still no success, return helpful error
+    if (!usedModel || data?.error) {
+      const errorMessage = lastError?.message || data?.error?.message || 'Unknown error';
+      
+      // Check for quota error and provide helpful message
+      if (errorMessage.includes('quota') || errorMessage.includes('rate') || errorMessage.includes('limit')) {
+        return NextResponse.json({
+          error: 'API quota exceeded. Please try again in a few minutes, or check your Google AI Studio dashboard to monitor usage.',
+          details: 'Free tier limits: 15 requests/minute, 1500 requests/day. Consider enabling billing for higher limits.',
+          retryAfter: 60
+        }, { status: 429 });
+      }
+
       return NextResponse.json(
-        { error: data.error.message || 'Gemini API error' },
-        { status: data.error.code || 500 }
+        { error: errorMessage },
+        { status: data?.error?.code || 500 }
       );
     }
 
@@ -191,6 +263,7 @@ Return the results as valid JSON only, no other text.`;
       articles,
       searchSummary: parsed.searchSummary || '',
       totalSources: parsed.totalSources || articles.length,
+      model: usedModel,
       groundingMetadata: groundingMetadata ? {
         searchQueries: groundingMetadata.webSearchQueries || [],
         sourceCount: groundingMetadata.groundingChunks?.length || 0
